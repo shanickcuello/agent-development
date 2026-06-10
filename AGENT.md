@@ -521,6 +521,7 @@ Never:
 - Skip specification
 - Skip tests
 - Skip lint/typecheck
+- Skip pre-commit hooks (--no-verify)
 - Push without permission
 - Disable failing tests
 - Add placeholders
