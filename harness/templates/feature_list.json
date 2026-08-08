@@ -1,0 +1,24 @@
+{
+  "project": "CHANGE_ME",
+  "description": "Scope of work, one feature at a time. The harness refuses to have two features in_progress simultaneously.",
+  "rules": {
+    "one_feature_at_a_time": true,
+    "require_tests_to_close": true,
+    "require_review_to_close": true,
+    "valid_status": ["pending", "in_progress", "review", "done", "blocked"]
+  },
+  "features": [
+    {
+      "id": 1,
+      "name": "example_feature",
+      "title": "Replace me with your first real feature",
+      "description": "Every feature needs a name the reports can be keyed by (progress/impl_<name>.md), a one-line title, and acceptance criteria specific enough that a reviewer can check them off without asking you anything.",
+      "acceptance": [
+        "Criteria are observable from outside the code",
+        "Each criterion names the behaviour, not the implementation",
+        "A test exists that fails if the criterion is violated"
+      ],
+      "status": "pending"
+    }
+  ]
+}

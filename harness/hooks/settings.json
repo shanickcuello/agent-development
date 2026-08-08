@@ -1,0 +1,34 @@
+{
+  "$comment": "Harness hooks. The harness executes these, not the model, so an agent cannot skip them. Merged into your existing .claude/settings.json by `harness init`.",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./harness hook post-edit",
+            "description": "After each edit, run the profile's fast check (typecheck or lint) and print the result."
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./harness hook stop",
+            "description": "Before the session ends, report the active feature, missing reports and verification freshness."
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(./harness:*)",
+      "Bash(.harness/bin/harness:*)"
+    ]
+  }
+}

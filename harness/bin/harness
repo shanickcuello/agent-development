@@ -1,0 +1,1125 @@
+#!/usr/bin/env python3
+"""Harness CLI — deterministic guardrails for multi-agent development.
+
+This CLI is the part of the workflow that agents cannot talk their way out of.
+Every claim an agent makes ("tests pass", "feature done") is verified against
+files on disk, not against what the model says.
+
+Stack-agnostic: all build/test commands come from `.harness/profile.env`, so the
+same harness runs on Next.js today, FastAPI tomorrow and Flutter next week.
+
+No third-party dependencies. Python 3.8+.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+# --------------------------------------------------------------------------
+# Paths & constants
+# --------------------------------------------------------------------------
+
+HARNESS_DIR_NAME = ".harness"
+FEATURES_FILE = "feature_list.json"
+PROGRESS_DIR = "progress"
+REPORTS_DIR = "test-reports"
+
+VALID_STATUS = ("pending", "in_progress", "review", "done", "blocked")
+
+# Steps run by `verify`, in order. (key, profile variable, label)
+VERIFY_STEPS = [
+    ("lint", "HARNESS_LINT", "Lint"),
+    ("typecheck", "HARNESS_TYPECHECK", "Typecheck"),
+    ("unit", "HARNESS_UNIT", "Unit tests"),
+    ("e2e", "HARNESS_E2E", "E2E tests"),
+]
+
+RESET = "\033[0m"
+BOLD = "\033[1m"
+RED = "\033[31m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+BLUE = "\033[34m"
+DIM = "\033[2m"
+
+
+def _color(text: str, code: str) -> str:
+    if os.environ.get("NO_COLOR") or not sys.stdout.isatty():
+        return text
+    return f"{code}{text}{RESET}"
+
+
+def ok(msg: str) -> None:
+    print(f"{_color('✓', GREEN)} {msg}")
+
+
+def fail(msg: str) -> None:
+    print(f"{_color('✗', RED)} {msg}")
+
+
+def warn(msg: str) -> None:
+    print(f"{_color('!', YELLOW)} {msg}")
+
+
+def info(msg: str) -> None:
+    print(f"{_color('·', BLUE)} {msg}")
+
+
+def die(msg: str, code: int = 1) -> "NoReturn":  # type: ignore[valid-type]
+    fail(msg)
+    sys.exit(code)
+
+
+# --------------------------------------------------------------------------
+# Project context
+# --------------------------------------------------------------------------
+
+
+class Project:
+    """Everything the CLI needs to know about the repo it is running in."""
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.harness_dir = root / HARNESS_DIR_NAME
+        self.profile_path = self.harness_dir / "profile.env"
+        self.features_path = root / FEATURES_FILE
+        self.progress_dir = root / PROGRESS_DIR
+        self.reports_dir = root / REPORTS_DIR
+
+    # -- profile ---------------------------------------------------------
+
+    @property
+    def profile(self) -> dict:
+        if not self.profile_path.exists():
+            die(
+                "No profile found. Run the bootstrap first:\n"
+                "    bash /path/to/agent-development/harness.sh"
+            )
+        return parse_env(self.profile_path)
+
+    def cmd(self, key: str) -> str:
+        return (self.profile.get(key) or "").strip()
+
+    # -- features --------------------------------------------------------
+
+    def load_features(self) -> dict:
+        if not self.features_path.exists():
+            die(f"{FEATURES_FILE} not found. Run `harness init` first.")
+        try:
+            return json.loads(self.features_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            die(f"{FEATURES_FILE} is not valid JSON: {exc}")
+
+    def save_features(self, data: dict) -> None:
+        tmp = self.features_path.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        tmp.replace(self.features_path)
+
+    def find_feature(self, data: dict, ident: str) -> dict:
+        ident = str(ident)
+        for feat in data.get("features", []):
+            if str(feat.get("id")) == ident or feat.get("name") == ident:
+                return feat
+        die(f"Feature '{ident}' not found in {FEATURES_FILE}.")
+
+
+def find_root(start: Path) -> Path:
+    """Walk up until a .harness directory or a .git directory is found."""
+    cur = start.resolve()
+    for candidate in [cur, *cur.parents]:
+        if (candidate / HARNESS_DIR_NAME).is_dir():
+            return candidate
+    for candidate in [cur, *cur.parents]:
+        if (candidate / ".git").exists():
+            return candidate
+    return cur
+
+
+def parse_env(path: Path) -> dict:
+    """Parse a KEY=value file. Supports # comments and optional quotes."""
+    out: dict = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        out[key.strip()] = value
+    return out
+
+
+# --------------------------------------------------------------------------
+# Stack detection
+# --------------------------------------------------------------------------
+
+
+def detect_profile(root: Path) -> str:
+    """Pick a profile name from the files present in the repo."""
+    if (root / "pubspec.yaml").exists():
+        return "flutter"
+    if (root / "package.json").exists():
+        return "node-web"
+    if (root / "pyproject.toml").exists() or (root / "requirements.txt").exists():
+        return "python-web"
+    if (root / "go.mod").exists():
+        return "go"
+    return "generic"
+
+
+def node_script_names(root: Path) -> set:
+    pkg = root / "package.json"
+    if not pkg.exists():
+        return set()
+    try:
+        return set(json.loads(pkg.read_text(encoding="utf-8")).get("scripts", {}).keys())
+    except json.JSONDecodeError:
+        return set()
+
+
+def render_profile(root: Path, name: str) -> str:
+    """Build a profile.env body, adapted to what the repo actually has."""
+    templates_dir = Path(__file__).resolve().parent.parent / "profiles"
+    template = templates_dir / f"{name}.env"
+    if not template.exists():
+        template = templates_dir / "generic.env"
+    body = template.read_text(encoding="utf-8")
+
+    if name == "node-web":
+        scripts = node_script_names(root)
+        pm = "npm"
+        if (root / "pnpm-lock.yaml").exists():
+            pm = "pnpm"
+        elif (root / "yarn.lock").exists():
+            pm = "yarn"
+        elif (root / "bun.lockb").exists():
+            pm = "bun"
+
+        def script(key: str, fallback: str = "") -> str:
+            return f"{pm} run {key}" if key in scripts else fallback
+
+        configs = sorted(root.glob("playwright.config.*"))
+        has_pw = bool(configs)
+        e2e = ""
+        if has_pw:
+            e2e = "npx playwright test --config .harness/playwright.harness.ts"
+        elif "test:e2e" in scripts:
+            e2e = script("test:e2e")
+
+        # Prefer the baseURL the project already uses over a guessed port.
+        dev_url = "http://localhost:3000"
+        if configs:
+            match = re.search(
+                r"baseURL\s*:\s*['\"]([^'\"]+)['\"]",
+                configs[0].read_text(encoding="utf-8"),
+            )
+            if match:
+                dev_url = match.group(1)
+
+        replacements = {
+            "__DEV_URL__": dev_url,
+            "__INSTALL__": f"{pm} install",
+            "__LINT__": script("lint"),
+            "__TYPECHECK__": script("typecheck", script("tsc")),
+            "__UNIT__": script("test"),
+            "__E2E__": e2e,
+            "__BUILD__": script("build"),
+            "__DEV__": script("dev", script("start")),
+            "__E2E_KIND__": "playwright" if has_pw else "",
+        }
+        for token, value in replacements.items():
+            body = body.replace(token, value)
+
+    return body
+
+
+# --------------------------------------------------------------------------
+# Command execution
+# --------------------------------------------------------------------------
+
+
+def run_step(command: str, cwd: Path, log_path: Path, timeout: int = 1800) -> dict:
+    """Run one shell command, tee its output to a log file, return a result dict."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    started = time.time()
+    try:
+        proc = subprocess.run(
+            command,
+            shell=True,
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        output = (proc.stdout or "") + (proc.stderr or "")
+        code = proc.returncode
+    except subprocess.TimeoutExpired:
+        output = f"TIMEOUT after {timeout}s"
+        code = 124
+    except Exception as exc:  # noqa: BLE001 - surface any launch failure verbatim
+        output = f"FAILED TO LAUNCH: {exc}"
+        code = 127
+
+    duration = round(time.time() - started, 2)
+    log_path.write_text(output, encoding="utf-8")
+    return {
+        "command": command,
+        "exit_code": code,
+        "passed": code == 0,
+        "duration_s": duration,
+        "log": str(log_path),
+        "tail": "\n".join(output.strip().splitlines()[-25:]),
+    }
+
+
+def timestamp_slug() -> str:
+    return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+
+def make_report_dir(project: Project, feature: str) -> Path:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", str(feature)).strip("-").lower() or "adhoc"
+    path = project.reports_dir / f"test_{slug}_{timestamp_slug()}"
+    (path / "logs").mkdir(parents=True, exist_ok=True)
+    (path / "screenshots").mkdir(parents=True, exist_ok=True)
+    return path
+
+
+# --------------------------------------------------------------------------
+# Freshness — the anti-lying check
+# --------------------------------------------------------------------------
+
+
+def newest_source_mtime(project: Project) -> float:
+    """Latest mtime across the globs the profile declares as source."""
+    globs = [
+        g.strip()
+        for g in (project.cmd("HARNESS_SOURCE_GLOBS") or "src/**/*").split(",")
+        if g.strip()
+    ]
+    ignored = {".git", "node_modules", ".harness", "test-reports", "dist", "build",
+               ".venv", "venv", "__pycache__", ".next", "coverage"}
+    newest = 0.0
+    for pattern in globs:
+        for path in project.root.glob(pattern):
+            if not path.is_file():
+                continue
+            if ignored & set(path.relative_to(project.root).parts):
+                continue
+            newest = max(newest, path.stat().st_mtime)
+    return newest
+
+
+def load_last_verify(project: Project) -> dict | None:
+    pointer = project.harness_dir / "last-verify.json"
+    if not pointer.exists():
+        return None
+    try:
+        return json.loads(pointer.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+
+
+def cmd_init(project: Project, args) -> int:
+    """Scaffold harness state into the project. Idempotent."""
+    src = Path(__file__).resolve().parent.parent
+    root = project.root
+
+    name = args.profile if args.profile and args.profile != "auto" else detect_profile(root)
+    info(f"Detected stack profile: {_color(name, BOLD)}")
+
+    project.harness_dir.mkdir(exist_ok=True)
+    if not project.profile_path.exists() or args.force:
+        project.profile_path.write_text(render_profile(root, name), encoding="utf-8")
+        ok(f"Wrote {HARNESS_DIR_NAME}/profile.env")
+    else:
+        info(f"{HARNESS_DIR_NAME}/profile.env already exists — kept (use --force to reset)")
+
+    # Progress + report directories
+    for directory in (project.progress_dir, project.reports_dir):
+        directory.mkdir(exist_ok=True)
+    _write_if_missing(
+        project.progress_dir / "current.md",
+        "# Active session\n\n_No active session yet._\n",
+    )
+    _write_if_missing(
+        project.progress_dir / "history.md",
+        "# History\n\nAppend-only log of closed sessions.\n",
+    )
+
+    # Templates
+    templates = src / "templates"
+    _copy_if_missing(templates / "AGENTS.md", root / "AGENTS.md")
+    _copy_if_missing(templates / "CHECKPOINTS.md", root / "CHECKPOINTS.md")
+    if not project.features_path.exists():
+        skeleton = json.loads((templates / "feature_list.json").read_text(encoding="utf-8"))
+        skeleton["project"] = _project_name(root)
+        project.save_features(skeleton)
+        ok(f"Created {FEATURES_FILE} for '{skeleton['project']}' with one sample feature")
+
+    # Claude agents / commands / hooks
+    claude = root / ".claude"
+    (claude / "agents").mkdir(parents=True, exist_ok=True)
+    (claude / "commands").mkdir(parents=True, exist_ok=True)
+    for agent in (src / "agents").glob("*.md"):
+        shutil.copyfile(agent, claude / "agents" / agent.name)
+    for command in (src / "commands").glob("*.md"):
+        shutil.copyfile(command, claude / "commands" / command.name)
+    ok("Installed 5 agents and 4 slash commands into .claude/")
+
+    merge_settings(claude / "settings.json", src / "hooks" / "settings.json")
+    ok("Merged harness hooks into .claude/settings.json")
+
+    inject_claude_md(root / "CLAUDE.md", templates / "CLAUDE.harness.md")
+    ok("Injected harness block into CLAUDE.md")
+
+    if name == "node-web" and any(root.glob("playwright.config.*")):
+        write_playwright_config(project, src)
+        ok(f"Wrote {HARNESS_DIR_NAME}/playwright.harness.ts (screenshots on, dated reports)")
+
+    ensure_gitignore(root)
+    ok("Updated .gitignore")
+
+    print()
+    ok(f"Harness ready. Profile: {_color(name, BOLD)}")
+    print(f"  Next: {_color('./harness doctor', BOLD)}")
+    return 0
+
+
+def _project_name(root: Path) -> str:
+    """Best-effort project name: package.json, pyproject, pubspec, else the folder."""
+    pkg = root / "package.json"
+    if pkg.exists():
+        try:
+            name = json.loads(pkg.read_text(encoding="utf-8")).get("name")
+            if name:
+                return str(name)
+        except json.JSONDecodeError:
+            pass
+    for filename, pattern in (
+        ("pyproject.toml", r'^\s*name\s*=\s*["\']([^"\']+)'),
+        ("pubspec.yaml", r"^\s*name:\s*(\S+)"),
+    ):
+        path = root / filename
+        if path.exists():
+            match = re.search(pattern, path.read_text(encoding="utf-8"), re.M)
+            if match:
+                return match.group(1)
+    return root.name
+
+
+def _write_if_missing(path: Path, content: str) -> None:
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+
+def _copy_if_missing(src: Path, dst: Path) -> None:
+    if not dst.exists() and src.exists():
+        shutil.copyfile(src, dst)
+        ok(f"Created {dst.name}")
+
+
+def merge_settings(target: Path, source: Path) -> None:
+    """Merge harness hooks/permissions into an existing settings.json."""
+    incoming = json.loads(source.read_text(encoding="utf-8"))
+    current: dict = {}
+    if target.exists():
+        try:
+            current = json.loads(target.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            backup = target.with_suffix(".json.bak")
+            shutil.copyfile(target, backup)
+            warn(f"settings.json was invalid JSON — backed up to {backup.name}")
+
+    hooks = current.setdefault("hooks", {})
+    for event, entries in incoming.get("hooks", {}).items():
+        existing = hooks.setdefault(event, [])
+        serialized = json.dumps(existing, sort_keys=True)
+        for entry in entries:
+            if json.dumps(entry, sort_keys=True) not in serialized:
+                existing.append(entry)
+
+    perms = current.setdefault("permissions", {})
+    allow = perms.setdefault("allow", [])
+    for rule in incoming.get("permissions", {}).get("allow", []):
+        if rule not in allow:
+            allow.append(rule)
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        json.dumps(current, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+
+
+BEGIN_MARK = "<!-- BEGIN HARNESS -->"
+END_MARK = "<!-- END HARNESS -->"
+
+
+def inject_claude_md(target: Path, source: Path) -> None:
+    """Insert (or refresh) the harness block in CLAUDE.md, leaving the rest alone."""
+    block = f"{BEGIN_MARK}\n{source.read_text(encoding='utf-8').strip()}\n{END_MARK}\n"
+    if not target.exists():
+        target.write_text(block, encoding="utf-8")
+        return
+    body = target.read_text(encoding="utf-8")
+    if BEGIN_MARK in body and END_MARK in body:
+        head, _, rest = body.partition(BEGIN_MARK)
+        _, _, tail = rest.partition(END_MARK)
+        target.write_text(head + block + tail.lstrip("\n"), encoding="utf-8")
+    else:
+        target.write_text(body.rstrip() + "\n\n" + block, encoding="utf-8")
+
+
+def write_playwright_config(project: Project, src: Path) -> None:
+    configs = sorted(project.root.glob("playwright.config.*"))
+    base_import = "../" + configs[0].stem if configs else None
+    template = (src / "templates" / "playwright.harness.ts").read_text(encoding="utf-8")
+    template = template.replace("__BASE_CONFIG__", base_import or "")
+    (project.harness_dir / "playwright.harness.ts").write_text(template, encoding="utf-8")
+
+
+GITIGNORE_BLOCK = """
+# --- harness ---
+test-reports/
+.harness/last-verify.json
+.harness/last-report
+"""
+
+
+def ensure_gitignore(root: Path) -> None:
+    path = root / ".gitignore"
+    body = path.read_text(encoding="utf-8") if path.exists() else ""
+    if "# --- harness ---" in body:
+        return
+    path.write_text(body.rstrip() + "\n" + GITIGNORE_BLOCK, encoding="utf-8")
+
+
+def cmd_doctor(project: Project, args) -> int:
+    """Fast health check. Exits non-zero if the harness is not usable."""
+    print(_color("Harness doctor", BOLD))
+    problems = 0
+
+    profile = project.profile
+    ok(f"Profile: {profile.get('HARNESS_PROFILE', 'unknown')}")
+
+    for key, label in (("HARNESS_LINT", "lint"), ("HARNESS_UNIT", "unit tests")):
+        if not profile.get(key):
+            warn(f"No {label} command configured ({key} is empty)")
+
+    data = project.load_features()
+    features = data.get("features", [])
+    if not features:
+        warn(f"{FEATURES_FILE} has no features")
+    bad = [f for f in features if f.get("status") not in VALID_STATUS]
+    if bad:
+        fail(f"{len(bad)} feature(s) with invalid status: {[f.get('name') for f in bad]}")
+        problems += 1
+
+    active = [f for f in features if f.get("status") == "in_progress"]
+    if len(active) > 1:
+        fail(
+            "More than one feature in_progress — the harness enforces one at a time: "
+            + ", ".join(str(f.get("name")) for f in active)
+        )
+        problems += 1
+    elif active:
+        ok(f"Active feature: {active[0].get('name')} (#{active[0].get('id')})")
+    else:
+        counts = {}
+        for feat in features:
+            counts[feat.get("status")] = counts.get(feat.get("status"), 0) + 1
+        info(f"No feature in progress. {counts}")
+
+    for directory in (project.progress_dir, project.reports_dir):
+        if not directory.exists():
+            fail(f"Missing directory: {directory.name}/")
+            problems += 1
+
+    if not args.quick:
+        cmd = project.cmd("HARNESS_TYPECHECK") or project.cmd("HARNESS_LINT")
+        if cmd:
+            info(f"Running smoke check: {cmd}")
+            result = run_step(cmd, project.root, project.harness_dir / "doctor.log")
+            if result["passed"]:
+                ok(f"Smoke check passed ({result['duration_s']}s)")
+            else:
+                fail(f"Smoke check failed — see {HARNESS_DIR_NAME}/doctor.log")
+                print(_color(result["tail"], DIM))
+                problems += 1
+
+    print()
+    if problems:
+        fail(f"{problems} problem(s) found.")
+        return 1
+    ok("Harness is healthy.")
+    return 0
+
+
+def cmd_verify(project: Project, args) -> int:
+    """Run the full verification suite and write a dated report folder."""
+    feature = args.feature or _active_feature_name(project) or "adhoc"
+    report_dir = make_report_dir(project, feature)
+    env_note = f"HARNESS_REPORT_DIR={report_dir}"
+    os.environ["HARNESS_REPORT_DIR"] = str(report_dir)
+
+    print(_color(f"Verify: {feature}", BOLD))
+    info(f"Report: {report_dir.relative_to(project.root)}")
+
+    steps = VERIFY_STEPS
+    if args.fast:
+        steps = [s for s in steps if s[0] != "e2e"]
+        info("--fast: skipping E2E")
+    if args.only:
+        wanted = set(args.only.split(","))
+        steps = [s for s in steps if s[0] in wanted]
+
+    results = {}
+    all_passed = True
+    for key, var, label in steps:
+        command = project.cmd(var)
+        if not command:
+            info(f"{label}: skipped (no command configured)")
+            results[key] = {"skipped": True, "passed": True}
+            continue
+        print(f"  {_color('▶', BLUE)} {label}: {_color(command, DIM)}")
+        result = run_step(command, project.root, report_dir / "logs" / f"{key}.log")
+        results[key] = result
+        if result["passed"]:
+            ok(f"{label} passed ({result['duration_s']}s)")
+        else:
+            all_passed = False
+            fail(f"{label} failed (exit {result['exit_code']})")
+            print(_color(result["tail"], DIM))
+            if not args.keep_going:
+                break
+
+    shots = sorted((report_dir / "screenshots").glob("*.png"))
+    artifacts = sorted((report_dir / "artifacts").rglob("*.png")) if (report_dir / "artifacts").exists() else []
+
+    payload = {
+        "feature": feature,
+        "timestamp": time.time(),
+        "iso": datetime.now().isoformat(timespec="seconds"),
+        "passed": all_passed,
+        "profile": project.profile.get("HARNESS_PROFILE"),
+        "report_dir": str(report_dir),
+        "steps": results,
+        "screenshots": [str(p.relative_to(report_dir)) for p in shots + artifacts],
+        "env": env_note,
+    }
+    (report_dir / "verify.json").write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    (project.harness_dir / "last-verify.json").write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    write_report_md(report_dir, payload)
+
+    print()
+    rel = report_dir.relative_to(project.root)
+    if all_passed:
+        ok(f"Verification green → {rel}/report.md")
+        return 0
+    fail(f"Verification red → {rel}/report.md")
+    return 1
+
+
+def _active_feature_name(project: Project) -> str | None:
+    if not project.features_path.exists():
+        return None
+    for feat in project.load_features().get("features", []):
+        if feat.get("status") == "in_progress":
+            return str(feat.get("name") or feat.get("id"))
+    return None
+
+
+def write_report_md(report_dir: Path, payload: dict) -> None:
+    lines = [
+        f"# Test report — {payload['feature']}",
+        "",
+        f"- **Date:** {payload['iso']}",
+        f"- **Profile:** {payload['profile']}",
+        f"- **Result:** {'PASS' if payload['passed'] else 'FAIL'}",
+        "",
+        "## Steps",
+        "",
+        "| Step | Result | Duration | Log |",
+        "|------|--------|----------|-----|",
+    ]
+    for key, result in payload["steps"].items():
+        if result.get("skipped"):
+            lines.append(f"| {key} | skipped | — | — |")
+            continue
+        status = "PASS" if result["passed"] else f"FAIL (exit {result['exit_code']})"
+        lines.append(
+            f"| {key} | {status} | {result['duration_s']}s | `logs/{key}.log` |"
+        )
+
+    shots = payload.get("screenshots", [])
+    lines += ["", f"## Screenshots ({len(shots)})", ""]
+    if shots:
+        for shot in shots:
+            lines.append(f"### {Path(shot).stem}")
+            lines.append("")
+            lines.append(f"![{Path(shot).stem}]({shot})")
+            lines.append("")
+    else:
+        lines.append("_No screenshots captured in this run._")
+
+    failed = [k for k, v in payload["steps"].items() if not v.get("passed")]
+    if failed:
+        lines += ["", "## Failure tails", ""]
+        for key in failed:
+            lines += [f"### {key}", "", "```", payload["steps"][key].get("tail", ""), "```", ""]
+
+    (report_dir / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def cmd_explore(project: Project, args) -> int:
+    """Scaffold and run an exploratory ('manual') browser walkthrough."""
+    kind = project.cmd("HARNESS_E2E_KIND")
+    if kind != "playwright":
+        die(
+            "Exploratory runs need the playwright E2E kind. "
+            f"Current HARNESS_E2E_KIND='{kind or 'unset'}'."
+        )
+
+    feature = args.feature
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", feature).strip("-").lower()
+    spec_dir = project.root / "e2e" / "exploratory"
+    spec_dir.mkdir(parents=True, exist_ok=True)
+    spec = spec_dir / f"{slug}.spec.ts"
+
+    if not spec.exists() or args.force:
+        template = (
+            Path(__file__).resolve().parent.parent / "templates" / "exploratory.spec.ts"
+        ).read_text(encoding="utf-8")
+        spec.write_text(template.replace("__FEATURE__", feature), encoding="utf-8")
+        ok(f"Scaffolded {spec.relative_to(project.root)}")
+        if not args.run:
+            info("Edit the walkthrough, then re-run with --run")
+            return 0
+
+    report_dir = make_report_dir(project, f"explore-{slug}")
+    os.environ["HARNESS_REPORT_DIR"] = str(report_dir)
+    command = (
+        f"npx playwright test --config {HARNESS_DIR_NAME}/playwright.harness.ts "
+        f"{spec.relative_to(project.root)}"
+    )
+    print(f"  {_color('▶', BLUE)} {command}")
+    result = run_step(command, project.root, report_dir / "logs" / "explore.log")
+
+    shots = sorted((report_dir / "screenshots").glob("*.png"))
+    payload = {
+        "feature": f"explore-{slug}",
+        "timestamp": time.time(),
+        "iso": datetime.now().isoformat(timespec="seconds"),
+        "passed": result["passed"],
+        "profile": project.profile.get("HARNESS_PROFILE"),
+        "report_dir": str(report_dir),
+        "steps": {"explore": result},
+        "screenshots": [str(p.relative_to(report_dir)) for p in shots],
+    }
+    (report_dir / "verify.json").write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    write_report_md(report_dir, payload)
+
+    rel = report_dir.relative_to(project.root)
+    print()
+    if result["passed"]:
+        ok(f"Walkthrough finished — {len(shots)} screenshots → {rel}/report.md")
+        return 0
+    fail(f"Walkthrough failed → {rel}/report.md")
+    print(_color(result["tail"], DIM))
+    return 1
+
+
+def cmd_feature(project: Project, args) -> int:
+    data = project.load_features()
+    features = data.get("features", [])
+
+    if args.action == "list":
+        for feat in features:
+            status = feat.get("status", "?")
+            mark = {
+                "done": _color("done       ", GREEN),
+                "in_progress": _color("in_progress", YELLOW),
+                "blocked": _color("blocked    ", RED),
+                "review": _color("review     ", BLUE),
+            }.get(status, f"{status:<11}")
+            print(f"  [{mark}] #{feat.get('id')} {feat.get('name')} — {feat.get('title', '')}")
+        return 0
+
+    if args.action == "next":
+        for feat in features:
+            if feat.get("status") == "in_progress":
+                print(json.dumps(feat, indent=2, ensure_ascii=False))
+                info("This feature is already in progress.")
+                return 0
+        for feat in features:
+            if feat.get("status") == "pending":
+                print(json.dumps(feat, indent=2, ensure_ascii=False))
+                return 0
+        info("No pending features.")
+        return 0
+
+    if args.action == "start":
+        active = [f for f in features if f.get("status") == "in_progress"]
+        if active and str(active[0].get("id")) != str(args.id):
+            die(
+                f"Feature #{active[0].get('id')} ({active[0].get('name')}) is already "
+                "in progress. The harness enforces one feature at a time — close it "
+                "or mark it blocked first."
+            )
+        feat = project.find_feature(data, args.id)
+        if feat.get("status") == "done":
+            die(f"Feature #{feat.get('id')} is already done.")
+        feat["status"] = "in_progress"
+        feat["started_at"] = datetime.now().isoformat(timespec="seconds")
+        project.save_features(data)
+        ok(f"Feature #{feat.get('id')} {feat.get('name')} → in_progress")
+        return 0
+
+    if args.action == "block":
+        feat = project.find_feature(data, args.id)
+        feat["status"] = "blocked"
+        feat["blocked_reason"] = args.reason or "unspecified"
+        project.save_features(data)
+        warn(f"Feature #{feat.get('id')} → blocked: {feat['blocked_reason']}")
+        return 0
+
+    if args.action == "done":
+        feat = project.find_feature(data, args.id)
+        code = run_gate(project, feat, strict=True)
+        if code != 0:
+            fail("Gate failed — feature stays open. Nothing was modified.")
+            return code
+        feat["status"] = "done"
+        feat["closed_at"] = datetime.now().isoformat(timespec="seconds")
+        project.save_features(data)
+        ok(f"Feature #{feat.get('id')} {feat.get('name')} → done")
+        append_history(project, feat)
+        return 0
+
+    return 1
+
+
+def append_history(project: Project, feat: dict) -> None:
+    path = project.progress_dir / "history.md"
+    entry = (
+        f"\n## {datetime.now().isoformat(timespec='seconds')} — "
+        f"#{feat.get('id')} {feat.get('name')}\n\n"
+        f"{feat.get('title', '')}\n\n"
+        f"- impl: `progress/impl_{feat.get('name')}.md`\n"
+        f"- review: `progress/review_{feat.get('name')}.md`\n"
+        f"- test: `progress/test_{feat.get('name')}.md`\n"
+    )
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(entry)
+
+
+REQUIRED_REPORTS = [
+    ("impl", "implementer", False),
+    ("review", "reviewer", True),
+    ("test", "tester", True),
+]
+
+
+def run_gate(project: Project, feat: dict, strict: bool = True) -> int:
+    """The gate. Every condition is checked against disk, never against claims."""
+    name = feat.get("name")
+    print(_color(f"Gate: #{feat.get('id')} {name}", BOLD))
+    problems = []
+
+    if feat.get("status") not in ("in_progress", "review"):
+        problems.append(
+            f"status is '{feat.get('status')}' — expected in_progress or review"
+        )
+
+    for kind, author, needs_verdict in REQUIRED_REPORTS:
+        path = project.progress_dir / f"{kind}_{name}.md"
+        if not path.exists():
+            problems.append(f"missing {author} report: progress/{kind}_{name}.md")
+            continue
+        body = path.read_text(encoding="utf-8")
+        if needs_verdict:
+            match = re.search(r"^VERDICT:\s*(PASS|FAIL)\s*$", body, re.M | re.I)
+            if not match:
+                problems.append(
+                    f"progress/{kind}_{name}.md has no `VERDICT: PASS` / `VERDICT: FAIL` line"
+                )
+            elif match.group(1).upper() != "PASS":
+                problems.append(f"{author} verdict is FAIL in progress/{kind}_{name}.md")
+        else:
+            ok(f"{author} report present")
+
+    verify = load_last_verify(project)
+    if not verify:
+        problems.append("no verification run found — run `./harness verify` first")
+    else:
+        if not verify.get("passed"):
+            problems.append(
+                f"last verification FAILED ({verify.get('iso')}) → {verify.get('report_dir')}"
+            )
+        else:
+            ok(f"last verification green ({verify.get('iso')})")
+
+        newest = newest_source_mtime(project)
+        if newest > float(verify.get("timestamp", 0)):
+            changed = datetime.fromtimestamp(newest).isoformat(timespec="seconds")
+            problems.append(
+                f"source changed at {changed}, after the last verification "
+                f"({verify.get('iso')}) — re-run `./harness verify`"
+            )
+        else:
+            ok("verification is newer than the last source change")
+
+        if strict:
+            skipped = [
+                k for k, v in verify.get("steps", {}).items() if v.get("skipped")
+            ]
+            configured = [
+                k for k, var, _ in VERIFY_STEPS if project.cmd(var)
+            ]
+            missing = [k for k in configured if k in skipped]
+            if missing:
+                problems.append(
+                    f"steps skipped in the last verification but configured: {missing}"
+                )
+
+    print()
+    if problems:
+        fail(f"Gate BLOCKED — {len(problems)} problem(s):")
+        for problem in problems:
+            print(f"    {_color('•', RED)} {problem}")
+        return 1
+    ok("Gate PASSED — feature may be closed.")
+    return 0
+
+
+def cmd_gate(project: Project, args) -> int:
+    data = project.load_features()
+    feat = project.find_feature(data, args.id)
+    return run_gate(project, feat, strict=not args.lenient)
+
+
+def cmd_report(project: Project, args) -> int:
+    """Create a progress report from a template, so agents can't invent the format."""
+    kind = args.kind
+    name = args.feature
+    path = project.progress_dir / f"{kind}_{name}.md"
+    if path.exists() and not args.force:
+        info(f"{path.relative_to(project.root)} already exists — edit it directly.")
+        print(path)
+        return 0
+
+    template_path = (
+        Path(__file__).resolve().parent.parent / "templates" / f"report_{kind}.md"
+    )
+    body = template_path.read_text(encoding="utf-8")
+    body = body.replace("__FEATURE__", name)
+    body = body.replace("__DATE__", datetime.now().isoformat(timespec="seconds"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    ok(f"Created {path.relative_to(project.root)}")
+    print(path)
+    return 0
+
+
+def cmd_status(project: Project, args) -> int:
+    data = project.load_features()
+    features = data.get("features", [])
+    counts: dict = {}
+    for feat in features:
+        counts[feat.get("status", "?")] = counts.get(feat.get("status", "?"), 0) + 1
+
+    print(_color(f"{data.get('project', project.root.name)}", BOLD))
+    print(f"  profile   {project.profile.get('HARNESS_PROFILE')}")
+    print(f"  features  {counts}")
+
+    active = [f for f in features if f.get("status") == "in_progress"]
+    if active:
+        feat = active[0]
+        print(f"  active    #{feat.get('id')} {feat.get('name')} — {feat.get('title','')}")
+        for kind, _author, _v in REQUIRED_REPORTS:
+            path = project.progress_dir / f"{kind}_{feat.get('name')}.md"
+            mark = _color("✓", GREEN) if path.exists() else _color("·", DIM)
+            print(f"     {mark} progress/{kind}_{feat.get('name')}.md")
+    else:
+        print("  active    none")
+
+    verify = load_last_verify(project)
+    if verify:
+        state = _color("PASS", GREEN) if verify.get("passed") else _color("FAIL", RED)
+        print(f"  verify    {state} at {verify.get('iso')}")
+        stale = newest_source_mtime(project) > float(verify.get("timestamp", 0))
+        if stale:
+            print(f"            {_color('stale — source changed since', YELLOW)}")
+        report = Path(verify.get("report_dir", ""))
+        if report.exists():
+            print(f"  report    {report.relative_to(project.root)}/report.md")
+    else:
+        print(f"  verify    {_color('never run', DIM)}")
+
+    reports = sorted(project.reports_dir.glob("test_*"), reverse=True)[:5]
+    if reports:
+        print("  recent reports:")
+        for report in reports:
+            print(f"     {report.relative_to(project.root)}")
+    return 0
+
+
+def cmd_optimize(project: Project, args) -> int:
+    """Check/wire the token-optimization layer: CodeGraph, RTK, Caveman."""
+    script = Path(__file__).resolve().parent / "optimize.sh"
+    cmd = ["bash", str(script), str(project.root)]
+    if args.install:
+        cmd.append("--install")
+    return subprocess.call(cmd, cwd=str(project.root))
+
+
+def cmd_hook(project: Project, args) -> int:
+    """Entry point for Claude Code hooks. Never blocks on advisory events."""
+    if args.event == "post-edit":
+        command = project.cmd("HARNESS_TYPECHECK") or project.cmd("HARNESS_LINT")
+        if not command:
+            return 0
+        result = run_step(command, project.root, project.harness_dir / "hook.log", timeout=300)
+        if result["passed"]:
+            print("[harness] typecheck/lint OK")
+        else:
+            print("[harness] typecheck/lint FAILED — fix before continuing:")
+            print(result["tail"])
+        return 0
+
+    if args.event == "stop":
+        active = _active_feature_name(project)
+        if not active:
+            print("[harness] no feature in progress")
+            return 0
+        verify = load_last_verify(project)
+        missing = [
+            f"progress/{kind}_{active}.md"
+            for kind, _a, _v in REQUIRED_REPORTS
+            if not (project.progress_dir / f"{kind}_{active}.md").exists()
+        ]
+        parts = [f"[harness] active feature: {active}"]
+        if missing:
+            parts.append(f"missing reports: {', '.join(missing)}")
+        if not verify:
+            parts.append("verification never run — ./harness verify")
+        elif not verify.get("passed"):
+            parts.append(f"last verification FAILED → {verify.get('report_dir')}")
+        elif newest_source_mtime(project) > float(verify.get("timestamp", 0)):
+            parts.append("verification is stale — source changed since")
+        else:
+            parts.append("verification green")
+        print(" | ".join(parts))
+        return 0
+
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Argument parsing
+# --------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="harness",
+        description="Deterministic guardrails for multi-agent development.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_init = sub.add_parser("init", help="scaffold the harness into this project")
+    p_init.add_argument("--profile", default="auto", help="stack profile (default: auto-detect)")
+    p_init.add_argument("--force", action="store_true", help="overwrite profile.env")
+    p_init.set_defaults(func=cmd_init)
+
+    p_doctor = sub.add_parser("doctor", help="health check; non-zero if unusable")
+    p_doctor.add_argument("--quick", action="store_true", help="skip the smoke check")
+    p_doctor.set_defaults(func=cmd_doctor)
+
+    p_verify = sub.add_parser("verify", help="run lint+typecheck+unit+e2e into a dated report")
+    p_verify.add_argument("feature", nargs="?", help="feature name (default: the active one)")
+    p_verify.add_argument("--fast", action="store_true", help="skip E2E")
+    p_verify.add_argument("--only", help="comma-separated subset: lint,typecheck,unit,e2e")
+    p_verify.add_argument("--keep-going", action="store_true", help="do not stop at first failure")
+    p_verify.set_defaults(func=cmd_verify)
+
+    p_explore = sub.add_parser("explore", help="scaffold/run an exploratory browser walkthrough")
+    p_explore.add_argument("feature")
+    p_explore.add_argument("--run", action="store_true", help="run it after scaffolding")
+    p_explore.add_argument("--force", action="store_true", help="overwrite the spec")
+    p_explore.set_defaults(func=cmd_explore)
+
+    p_feature = sub.add_parser("feature", help="inspect and move features through the flow")
+    p_feature.add_argument("action", choices=["list", "next", "start", "block", "done"])
+    p_feature.add_argument("id", nargs="?", help="feature id or name")
+    p_feature.add_argument("reason", nargs="?", help="reason (for block)")
+    p_feature.set_defaults(func=cmd_feature)
+
+    p_gate = sub.add_parser("gate", help="check whether a feature may be closed")
+    p_gate.add_argument("id")
+    p_gate.add_argument("--lenient", action="store_true", help="warn instead of enforcing skips")
+    p_gate.set_defaults(func=cmd_gate)
+
+    p_report = sub.add_parser("report", help="create a progress report from a template")
+    p_report.add_argument("kind", choices=["impl", "review", "test", "explore"])
+    p_report.add_argument("feature")
+    p_report.add_argument("--force", action="store_true")
+    p_report.set_defaults(func=cmd_report)
+
+    p_status = sub.add_parser("status", help="one-screen summary of the harness state")
+    p_status.set_defaults(func=cmd_status)
+
+    p_opt = sub.add_parser("optimize", help="check/wire CodeGraph, RTK and Caveman")
+    p_opt.add_argument(
+        "--install",
+        action="store_true",
+        help="actually run the third-party installers (they pipe curl into a shell)",
+    )
+    p_opt.set_defaults(func=cmd_optimize)
+
+    p_hook = sub.add_parser("hook", help="internal: called by Claude Code hooks")
+    p_hook.add_argument("event", choices=["post-edit", "stop"])
+    p_hook.set_defaults(func=cmd_hook)
+
+    return parser
+
+
+def main(argv: list) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    root = Path(os.environ.get("HARNESS_ROOT") or find_root(Path.cwd()))
+    project = Project(root)
+    try:
+        return args.func(project, args)
+    except KeyboardInterrupt:
+        print()
+        warn("Interrupted.")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
