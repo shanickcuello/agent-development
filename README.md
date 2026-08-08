@@ -4,12 +4,108 @@ Multi-agent development harness. Drop it into any repository and get a
 leader → implementer → reviewer → tester chain whose claims are checked by
 scripts, not taken on trust.
 
+---
+
+## Install — once per project
+
+**1. Get this repo** (once per machine)
+
 ```bash
-bash /path/to/agent-development/harness.sh /path/to/your/project
+git clone git@github.com:shanickcuello/agent-development.git ~/agent-development
 ```
 
-One command. It detects the stack, scaffolds the state files, installs the
-agents and hooks, wires the token-optimization layer, and runs a health check.
+**2. Run the bootstrap inside your project**
+
+```bash
+cd /path/to/your/project
+bash ~/agent-development/harness.sh .
+```
+
+Detects the stack, scaffolds everything, wires the hooks, checks CodeGraph/RTK/Caveman.
+Add `--install-tools` if you also want it to install the missing ones.
+
+**3. Check what it guessed**
+
+```bash
+cat .harness/profile.env      # lint / typecheck / unit / e2e commands
+```
+
+Wrong command or port? Edit the line. That file is the whole stack config.
+
+**4. Define your scope**
+
+Replace the sample entry in `feature_list.json` with real features. Each needs a
+`name` (reports are keyed by it), a `title`, and acceptance criteria specific
+enough that a reviewer can tick them off without asking you anything.
+
+**5. Restart Claude Code**
+
+So it picks up the new agents, commands and hooks. Then confirm:
+
+```bash
+./harness doctor
+```
+
+Green means you are done. Re-run step 2 anytime to upgrade a project to a newer
+harness — it never overwrites your state.
+
+---
+
+## Usage — every day
+
+**1. See where you stand**
+
+```bash
+./harness status
+```
+
+Active feature, which reports exist, whether the last verification is green,
+red, or stale.
+
+**2. Run a feature**
+
+In Claude Code:
+
+```
+/feature
+```
+
+That is the whole loop: picks the next pending feature, claims it, then runs
+implementer → reviewer → tester-auto → tester-manual, sending work back on any
+`FAIL`. Pass an id to choose: `/feature 3`.
+
+**3. Watch it happen**
+
+Open `progress/` in your editor. Each report appears as its subagent finishes —
+`impl_*.md`, `review_*.md`, `test_*.md`. Nothing travels through chat, so this
+is where you audit who decided what.
+
+**4. Look at the screenshots**
+
+```bash
+open test-reports/<latest>/report.md
+```
+
+Every exploratory step, embedded in order. This is the part worth thirty
+seconds of your attention — it catches what assertions never do.
+
+**5. Close it**
+
+```bash
+./harness feature done <id>
+```
+
+Runs the gate first and refuses if anything is missing, red, or stale. When it
+refuses, `./harness gate <id>` tells you exactly what to fix.
+
+### The rest of the time
+
+```bash
+./harness verify --fast          # lint + typecheck + unit, no e2e
+./harness explore <name> --run    # exploratory walkthrough on demand
+/qa                               # test code that already exists, no implementer
+/gate                             # what is blocking the active feature
+```
 
 ---
 
