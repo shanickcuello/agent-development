@@ -1,34 +1,34 @@
-## Harness
+## Workflow — spec-driven TDD, inline
 
-This repository runs the multi-agent harness. Read `AGENTS.md` first.
+Work **inline**: you edit the source and tests yourself. Do **not** run a
+multi-agent chain (separate implementer/reviewer/tester subagents) or a
+`feature`/`gate` pipeline — it is expensive (cold start + re-reading + slow e2e
+per agent) and unnecessary for a solo developer. Spawn a subagent only when the
+human explicitly asks, or for a genuinely large parallel search.
 
-### Your role: leader
+### Organize work as spec docs
 
-You act as the `leader` agent (`.claude/agents/leader.md`). You decompose and
-coordinate. You do **not** implement.
+Numbered spec docs live in `docs/specs/spec-NNN-<slug>.md`: a short **Context**,
+a **phased checklist** (`[ ]` / `[x]`), and exact acceptance / copy where it
+matters. The spec is the backlog and the definition of done — not
+`feature_list.json`.
 
-- Do not edit source or test files directly. Delegate via the `Agent` tool.
-- Do not mark features `done` by editing `feature_list.json`. Use
-  `./harness feature done <id>` — it runs the gate and refuses when red.
-- Do not claim anything passed. Run `./harness verify` and cite the report path.
+### TDD is the rule
 
-Docs, configuration and `progress/` you may edit yourself. Pure questions about
-the repo you answer yourself — no subagent needed to read a file.
+For each item, in this order:
 
-### The chain
+1. **Unit test first** — write the failing test, watch it go red.
+2. **Code** — implement until the unit test is green.
+3. **E2E** — add/adjust the Playwright flow for anything user-facing.
+4. **Verify** — run `./harness verify` (lint + typecheck + unit + e2e) and make
+   it green. E2E is slow, so run the full suite **once per item/phase at the
+   end**; use the unit runner for the fast red-green loop.
+5. **Commit** — one coherent commit per item/phase.
 
-`implementer` → `reviewer` → `tester-auto` → `tester-manual` → `./harness gate`
-
-Each writes `progress/<kind>_<feature>.md` and returns **only that path**. Code
-and findings never travel through chat.
-
-### Startup protocol
-
-1. Read `AGENTS.md`, `feature_list.json`, `progress/current.md`.
-2. Run `./harness doctor`. If it fails, stop and report.
-3. Run `./harness status` to see where the active feature stands.
+Never claim something passed without running it. `./harness verify` (or the raw
+`eslint` / typecheck / unit / e2e commands) is the guard.
 
 ### Token discipline
 
 Query `.codegraph/` for structure before reading files. Grep to a line before
-reading a file. Send wide searches to subagents. Never paste code into chat.
+reading a whole file. Never paste code into chat needlessly.

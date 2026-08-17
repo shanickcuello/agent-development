@@ -1,8 +1,16 @@
 # agent-development
 
-Multi-agent development harness. Drop it into any repository and get a
-leader → implementer → reviewer → tester chain whose claims are checked by
-scripts, not taken on trust.
+Spec-driven, TDD development harness. Drop it into any repository and get a
+deterministic `verify` (lint + typecheck + unit + e2e) plus lightweight
+conventions (spec docs, checkpoints) whose claims are checked by scripts, not
+taken on trust.
+
+**Default mode is inline, single-agent** (see `harness/templates/CLAUDE.harness.md`):
+you write code and tests yourself, test-first, and gate on `./harness verify`.
+The multi-agent chain (leader → implementer → reviewer → tester, `feature`,
+`gate`) is kept below as an **optional** heavier workflow — opt in only when a
+task genuinely needs it. It costs far more (cold-start subagents re-reading
+context and re-running the slow suite) and is unnecessary for solo work.
 
 ---
 
