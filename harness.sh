@@ -100,7 +100,31 @@ if [[ -n "$OPTIMIZE" ]]; then
   bash "$DEST/bin/optimize.sh" "$TARGET" "$INSTALL_TOOLS" || warn "Optimizer reported problems (non-fatal)"
 fi
 
-# --- 5. verify the install -------------------------------------------------
+# --- 5. git hook: keep the CodeGraph index current after every commit ------
+# Only if CodeGraph is on PATH and this is a git repo. Idempotent: skipped if
+# a post-commit hook already syncs CodeGraph; appended if one exists for other
+# reasons; installed fresh otherwise. Prefers Husky (.husky/) when present,
+# falls back to the plain .git/hooks/ dir.
+
+if command -v codegraph >/dev/null 2>&1 && git -C "$TARGET" rev-parse --git-dir >/dev/null 2>&1; then
+  if [[ -d "$TARGET/.husky" ]]; then
+    HOOK_DEST="$TARGET/.husky/post-commit"
+  else
+    HOOK_DEST="$TARGET/.git/hooks/post-commit"
+  fi
+  if [[ -f "$HOOK_DEST" ]] && grep -q "codegraph sync" "$HOOK_DEST" 2>/dev/null; then
+    info "post-commit hook already syncs CodeGraph — skipped"
+  elif [[ -f "$HOOK_DEST" ]]; then
+    { printf '\n'; cat "$DEST/templates/post-commit"; } >> "$HOOK_DEST"
+    ok "Appended CodeGraph sync to existing $HOOK_DEST"
+  else
+    cp "$DEST/templates/post-commit" "$HOOK_DEST"
+    ok "Installed post-commit hook: CodeGraph sync ($HOOK_DEST)"
+  fi
+  chmod +x "$HOOK_DEST"
+fi
+
+# --- 6. verify the install -------------------------------------------------
 
 if [[ -n "$RUN_DOCTOR" ]]; then
   printf '\n'

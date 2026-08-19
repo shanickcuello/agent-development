@@ -265,8 +265,11 @@ Run by the bootstrap, or on demand:
 - **RTK** compresses shell output before it reaches the agent (60–90% on dev
   operations). Checks for the `rtk-ai/rtk` vs `Rust Type Kit` name collision.
 - **CodeGraph** builds a semantic graph of the repo so agents query structure
-  instead of reading files to discover it. Indexes the project and turns
-  telemetry off.
+  instead of reading files to discover it. Indexes the project, registers its
+  MCP server (`codegraph install`) so the agent actually has the tools, turns
+  telemetry off, and installs a `post-commit` git hook (Husky if present, else
+  `.git/hooks/`) that runs `codegraph sync` after every commit so the index
+  never goes stale.
 - **Caveman** compresses agent output, and `/caveman-compress CLAUDE.md` pays
   off on every session afterwards.
 

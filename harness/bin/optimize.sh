@@ -73,12 +73,16 @@ if command -v codegraph >/dev/null 2>&1; then
       && ok "CodeGraph index created" \
       || warn "codegraph init failed — run it by hand in $PROJECT_ROOT"
   fi
+  # Register the MCP server too — the binary being installed doesn't imply the
+  # agent has it wired up. Idempotent: re-running just rewrites the same config.
+  codegraph install -y >/dev/null 2>&1 && ok "CodeGraph MCP server registered" \
+    || warn "codegraph install failed — run it by hand: codegraph install"
   codegraph telemetry off >/dev/null 2>&1 && info "CodeGraph telemetry off"
 elif want_install; then
   info "Installing CodeGraph…"
   curl -fsSL https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.sh | sh
   if command -v codegraph >/dev/null 2>&1; then
-    codegraph install
+    codegraph install -y >/dev/null 2>&1
     codegraph telemetry off >/dev/null 2>&1
     ( cd "$PROJECT_ROOT" && codegraph init ) && ok "CodeGraph installed and indexed"
   fi

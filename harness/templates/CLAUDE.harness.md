@@ -30,5 +30,10 @@ Never claim something passed without running it. `./harness verify` (or the raw
 
 ### Token discipline
 
-Query `.codegraph/` for structure before reading files. Grep to a line before
-reading a whole file. Never paste code into chat needlessly.
+If the CodeGraph MCP tools are available, use them first for structure —
+`codegraph_explore`/`codegraph_node`/callers/callees answer "where is X" and
+"who calls X" without reading whole files. The index syncs itself via a
+post-commit git hook, so it should be current; if it looks stale mid-session
+(uncommitted changes it hasn't seen yet), run `codegraph sync` by hand. Fall
+back to grep-to-a-line-then-read when CodeGraph isn't installed or doesn't
+have the answer. Never paste code into chat needlessly.

@@ -1,0 +1,6 @@
+#!/usr/bin/env sh
+# Installed by harness.sh. Keeps the CodeGraph index current after every
+# commit so agents query structure instead of reading files to find it.
+# No-ops (and never fails the commit) if CodeGraph isn't installed/indexed.
+command -v codegraph >/dev/null 2>&1 && [ -d .codegraph ] && codegraph sync . -q
+exit 0
