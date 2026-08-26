@@ -28,6 +28,22 @@ For each item, in this order:
 Never claim something passed without running it. `./harness verify` (or the raw
 `eslint` / typecheck / unit / e2e commands) is the guard.
 
+### Mutation check at spec close
+
+Before the spec's closing commit, pick the 1-2 most important behaviours added
+across the spec (a condition, a comparison, a boolean flag) and mutate them.
+Use the helper — it mutates, runs the tests, and reverts automatically (exact
+revert via `git checkout`, one shell call instead of an edit/run/edit-back
+loop):
+
+```bash
+.harness/bin/mutate-check.sh <file> '<old snippet>' '<new snippet>' -- <test command...>
+```
+
+Exit 0 = caught (good). Exit 2 = **survived** — the coverage is theatre:
+strengthen the test so it would catch the mutation, then re-run the helper to
+confirm exit 0 before committing.
+
 ### Token discipline
 
 If the CodeGraph MCP tools are available, use them first for structure —
